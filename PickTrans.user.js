@@ -2,8 +2,9 @@
 // @name         PickTrans
 // @namespace    picktrans.selection-translate
 // @version      1.1.0
-// @description  按住 Cmd 选中文本,调用 OpenAI completions 接口翻译,弹出只显示翻译结果的浮窗。齿轮按钮打开设置面板。
+// @description  选中文本后连按两下触发键,调用 OpenAI completions 接口翻译,弹出只显示翻译结果的浮窗。Tampermonkey 菜单提供设置入口。
 // @match        *://*/*
+// @license      MIT
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
