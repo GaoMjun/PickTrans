@@ -89,12 +89,14 @@
     box.textContent = '';
   }
 
-  async function translate(text) {
+  // 流式翻译:通过 GM_xmlhttpRequest 的 onprogress 增量读取 SSE,边收边回调
+  function translate(text, onDelta) {
     if (!config.apiKey) {
-      throw new Error('未配置 API Key,请在设置面板中填写');
+      return Promise.reject(new Error('未配置 API Key,请在设置面板中填写'));
     }
     const body = {
       model: config.model,
+      stream: true,
       messages: [
         { role: 'system', content: `You are a translation assistant. Translate the user's text into ${config.targetLang}. Output only the translation, nothing else, no explanations, no quotes.` },
         { role: 'user', content: text },
@@ -102,36 +104,111 @@
       temperature: 0.3,
     };
 
-    const doFetch = typeof GM_xmlhttpRequest === 'function';
-    if (doFetch) {
-      return new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-          method: 'POST',
-          url: config.apiUrl,
-          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.apiKey },
-          data: JSON.stringify(body),
-          onload: (res) => {
-            if (res.status < 200 || res.status >= 300) {
-              reject(new Error('HTTP ' + res.status + ': ' + res.responseText.slice(0, 200)));
+    return new Promise((resolve, reject) => {
+      let consumed = 0;      // 已解析到 responseText 的字符位置
+      let buffer = '';       // 未成行的残留
+      let failed = false;    // 已 reject,忽略后续回调
+      let gotText = false;   // 是否已输出过正式译文(content)
+      let hadReasoning = false; // 是否见过 reasoning_content(思维链,仅用于诊断,永不当作译文显示)
+
+      // 从一段 JSON 里取出正式译文(content / text)。
+      // 注意:reasoning_content 是模型的思维链,绝不作为译文返回。
+      function extract(json) {
+        const c = json && json.choices && json.choices[0];
+        if (!c) return null;
+        const d = c.delta || c.message || {};
+        let content = '';
+        if (typeof d.content === 'string') content += d.content;
+        if (typeof c.text === 'string') content += c.text;
+        return { content };
+      }
+
+      // 处理一行:支持 `data: {json}` (SSE) 和裸 `{json}` (一次性响应)
+      function parseLine(line) {
+        let s = line.trim();
+        if (!s) return;
+        if (s.startsWith('data:')) {
+          s = s.slice(5).trim();
+          if (s === '[DONE]') return;
+        }
+        if (s[0] !== '{') return;
+        try {
+          const json = JSON.parse(s);
+          // 只要见过思维链就标记一下(诊断用)
+          const c = json && json.choices && json.choices[0];
+          const dd = c && (c.delta || c.message);
+          if (dd && typeof dd.reasoning_content === 'string') hadReasoning = true;
+          const r = extract(json);
+          if (!r) return;
+          if (r.content) { gotText = true; onDelta(r.content); }
+        } catch (e) { /* 半行/非 JSON 片段,跳过 */ }
+      }
+
+      // 解析新增片段;flush=true 时把残留 buffer 也当作完整行处理
+      function consume(responseText, flush) {
+        buffer += responseText.slice(consumed);
+        consumed = responseText.length;
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // 末行可能不完整,留到下次
+        for (const line of lines) parseLine(line);
+        if (flush && buffer) { parseLine(buffer); buffer = ''; }
+        // 防御:异常大且不含换行的响应,避免 buffer 无限增长
+        if (buffer.length > 2000000) buffer = '';
+      }
+
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: config.apiUrl,
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.apiKey },
+        data: JSON.stringify(body),
+        onprogress: (res) => {
+          if (failed) return;
+          // 出错状态码:直接失败,不做非流式回退
+          if (res.status && (res.status < 200 || res.status >= 300)) {
+            failed = true;
+            reject(new Error('HTTP ' + res.status));
+            return;
+          }
+          consume(res.responseText || '', false);
+        },
+        onload: (res) => {
+          if (failed) return;
+          if (res.status < 200 || res.status >= 300) {
+            failed = true;
+            reject(new Error('HTTP ' + res.status + ': ' + (res.responseText || '').slice(0, 200)));
+            return;
+          }
+          const full = res.responseText || '';
+          consume(full, true);
+          if (!gotText) {
+            // 兜底:响应可能是多行缩进的整段 JSON,逐行解析不到,整体再试一次
+            try {
+              const json = JSON.parse(full);
+              const c = json && json.choices && json.choices[0];
+              const dd = c && (c.delta || c.message);
+              if (dd && typeof dd.reasoning_content === 'string') hadReasoning = true;
+              const r = extract(json);
+              if (r && r.content) { gotText = true; onDelta(r.content); }
+            } catch (e) { /* 忽略 */ }
+          }
+          if (!gotText) {
+            // 没有正式译文:如果模型只吐了思维链,说明该模型不适合直出译文
+            if (hadReasoning) {
+              reject(new Error('模型只返回了思维链(reasoning),没有正文译文。请在设置中换用非推理模型(如 gpt-4o-mini / deepseek-chat)'));
               return;
             }
-            try {
-              const json = JSON.parse(res.responseText);
-              resolve(json.choices[0].message.content.trim());
-            } catch (e) { reject(e); }
-          },
-          onerror: () => reject(new Error('Network error')),
-        });
+            reject(new Error('空响应:接口未返回任何译文内容'));
+            return;
+          }
+          resolve();
+        },
+        onerror: () => {
+          if (failed) return;
+          failed = true;
+          reject(new Error('Network error'));
+        },
       });
-    }
-    const resp = await fetch(config.apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.apiKey },
-      body: JSON.stringify(body),
     });
-    if (!resp.ok) throw new Error('HTTP ' + resp.status + ': ' + (await resp.text()).slice(0, 200));
-    const json = await resp.json();
-    return json.choices[0].message.content.trim();
   }
 
   function handleSelection() {
@@ -144,10 +221,51 @@
     showBox(info.range);
     loading = true;
 
-    translate(info.text)
-      .then((t) => { box.textContent = t; })
-      .catch((err) => { box.textContent = '翻译失败: ' + err.message; })
-      .finally(() => { loading = false; });
+    let acc = '';      // 已收到的译文
+    let shown = 0;     // 已显示的字符数
+    let rafId = null;  // 打字机动画帧
+    let done = false;  // 流是否已结束
+    let errored = false;
+
+    // 按码点安全截断,避免把 emoji/代理对切一半
+    function safeSlice(s, n) {
+      if (n >= s.length) return s;
+      const c = s.charCodeAt(n - 1);
+      if (c >= 0xD800 && c <= 0xDBFF) n += 1; // 高代理,补上低位
+      return s.slice(0, n);
+    }
+
+    // 打字机:每帧吐一点,长文本自动加速追平,保证逐字观感
+    function tick() {
+      rafId = null;
+      if (shown >= acc.length) {
+        if (done && !errored) loading = false;
+        return;
+      }
+      const gap = acc.length - shown;
+      const step = Math.max(2, Math.floor(gap / 20)); // 落后越多吐越快
+      shown = Math.min(acc.length, shown + step);
+      box.textContent = safeSlice(acc, shown);
+      positionBox(info.range);
+      rafId = requestAnimationFrame(tick);
+    }
+
+    translate(info.text, (piece) => {
+      acc += piece;
+      if (rafId === null) rafId = requestAnimationFrame(tick);
+    })
+      .then(() => {
+        done = true;
+        if (!acc) { box.textContent = '翻译失败: 空响应'; loading = false; return; }
+        if (rafId === null) rafId = requestAnimationFrame(tick);
+      })
+      .catch((err) => {
+        errored = true;
+        done = true;
+        if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+        box.textContent = '翻译失败: ' + err.message;
+        loading = false;
+      });
   }
 
   // 触发键对应的 KeyboardEvent.key 值(用于监听按下)
