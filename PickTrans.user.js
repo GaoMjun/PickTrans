@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         PickTrans
 // @namespace    picktrans.selection-translate
-// @version      1.2.0
+// @version      1.3.0
 // @description  选中文本后连按两下触发键,调用 OpenAI 接口翻译并弹出浮窗显示结果。支持自定义 API 地址、模型与目标语言,可在 Tampermonkey 菜单中设置。
+// @homepageURL  https://github.com/GaoMjun/PickTrans
+// @supportURL   https://github.com/GaoMjun/PickTrans/issues
 // @match        *://*/*
 // @license      MIT
 // @grant        GM_xmlhttpRequest
